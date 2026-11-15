@@ -1,0 +1,243 @@
+from fastapi import FastAPI, APIRouter
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import logging
+from pathlib import Path
+from pydantic import BaseModel, Field, ConfigDict
+from typing import List
+import uuid
+from datetime import datetime, timezone
+
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+# MongoDB connection
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+# Create the main app without a prefix
+app = FastAPI()
+
+# Create a router with the /api prefix
+api_router = APIRouter(prefix="/api")
+
+
+# Define Models
+class StatusCheck(BaseModel):
+    model_config = ConfigDict(extra="ignore")  # Ignore MongoDB's _id field
+    
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    client_name: str
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class StatusCheckCreate(BaseModel):
+    client_name: str
+
+
+# Lead Capture Models
+class LeadCreate(BaseModel):
+    name: str
+    whatsapp: str
+    category: str
+
+class Lead(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    whatsapp: str
+    category: str
+    status: str = "new"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# Promo Model
+class Promo(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    title: str
+    subtitle: str
+    description: str
+    valid_until: str
+    badge: str
+    is_active: bool = True
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class PromoUpdate(BaseModel):
+    title: str | None = None
+    subtitle: str | None = None
+    description: str | None = None
+    valid_until: str | None = None
+    badge: str | None = None
+    is_active: bool | None = None
+
+
+# Add your routes to the router instead of directly to app
+@api_router.get("/")
+async def root():
+    return {"message": "Hello World"}
+
+@api_router.post("/status", response_model=StatusCheck)
+async def create_status_check(input: StatusCheckCreate):
+    status_dict = input.model_dump()
+    status_obj = StatusCheck(**status_dict)
+    
+    # Convert to dict and serialize datetime to ISO string for MongoDB
+    doc = status_obj.model_dump()
+    doc['timestamp'] = doc['timestamp'].isoformat()
+    
+    _ = await db.status_checks.insert_one(doc)
+    return status_obj
+
+@api_router.get("/status", response_model=List[StatusCheck])
+async def get_status_checks():
+    # Exclude MongoDB's _id field from the query results
+    status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
+    
+    # Convert ISO string timestamps back to datetime objects
+    for check in status_checks:
+        if isinstance(check['timestamp'], str):
+            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
+    
+    return status_checks
+
+
+# ==================== LEAD CAPTURE ENDPOINTS ====================
+
+@api_router.post("/leads", response_model=Lead)
+async def create_lead(input: LeadCreate):
+    """Create a new lead from contact form submission"""
+    lead_dict = input.model_dump()
+    lead_obj = Lead(**lead_dict)
+    
+    # Convert to dict and serialize datetime for MongoDB
+    doc = lead_obj.model_dump()
+    doc['created_at'] = doc['created_at'].isoformat()
+    
+    await db.leads.insert_one(doc)
+    logger.info(f"New lead created: {lead_obj.name} - {lead_obj.category}")
+    return lead_obj
+
+
+@api_router.get("/leads", response_model=List[Lead])
+async def get_leads():
+    """Get all leads (for admin purposes)"""
+    leads = await db.leads.find({}, {"_id": 0}).to_list(1000)
+    
+    # Convert ISO string timestamps back to datetime objects
+    for lead in leads:
+        if isinstance(lead.get('created_at'), str):
+            lead['created_at'] = datetime.fromisoformat(lead['created_at'])
+    
+    return leads
+
+
+@api_router.get("/leads/{lead_id}", response_model=Lead)
+async def get_lead(lead_id: str):
+    """Get a specific lead by ID"""
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Lead not found")
+    
+    if isinstance(lead.get('created_at'), str):
+        lead['created_at'] = datetime.fromisoformat(lead['created_at'])
+    
+    return lead
+
+
+@api_router.patch("/leads/{lead_id}/status")
+async def update_lead_status(lead_id: str, status: str):
+    """Update lead status (e.g., 'new', 'contacted', 'converted')"""
+    result = await db.leads.update_one(
+        {"id": lead_id},
+        {"$set": {"status": status}}
+    )
+    if result.modified_count == 0:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Lead not found")
+    
+    return {"message": "Lead status updated", "status": status}
+
+
+# ==================== PROMO ENDPOINTS ====================
+
+@api_router.get("/promo")
+async def get_active_promo():
+    """Get the currently active promo"""
+    promo = await db.promos.find_one({"is_active": True}, {"_id": 0})
+    
+    if not promo:
+        # Return default promo if none exists
+        return {
+            "id": "default",
+            "title": "Promo Spesial Bulan Ini!",
+            "subtitle": "Diskon hingga 20% untuk renovasi dapur",
+            "description": "Dapatkan penawaran terbaik untuk renovasi rumah Anda. Slot terbatas!",
+            "valid_until": "31 Agustus 2025",
+            "badge": "TERBATAS",
+            "is_active": True
+        }
+    
+    return promo
+
+
+@api_router.put("/promo", response_model=Promo)
+async def update_promo(input: PromoUpdate):
+    """Update or create promo data"""
+    # Get existing active promo or create new
+    existing = await db.promos.find_one({"is_active": True})
+    
+    if existing:
+        # Update existing
+        update_data = {k: v for k, v in input.model_dump().items() if v is not None}
+        update_data['updated_at'] = datetime.now(timezone.utc).isoformat()
+        
+        await db.promos.update_one(
+            {"id": existing['id']},
+            {"$set": update_data}
+        )
+        
+        updated = await db.promos.find_one({"id": existing['id']}, {"_id": 0})
+        if isinstance(updated.get('updated_at'), str):
+            updated['updated_at'] = datetime.fromisoformat(updated['updated_at'])
+        return updated
+    else:
+        # Create new promo
+        promo_data = input.model_dump()
+        promo_data = {k: v for k, v in promo_data.items() if v is not None}
+        promo_obj = Promo(**promo_data)
+        
+        doc = promo_obj.model_dump()
+        doc['updated_at'] = doc['updated_at'].isoformat()
+        
+        await db.promos.insert_one(doc)
+        return promo_obj
+
+
+# Include the router in the main app
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
